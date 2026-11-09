@@ -6,7 +6,7 @@
 ║                                                                ║
 ║  Author  : SilentGhost.Exe1                                    ║
 ║  Usage   :                                                     ║
-║    python exescan.py 192.168.1.10 --ports 1-1000               ║
+║    python exescan.py 192.268.1.10 --ports 1-1000               ║
 ║    python exescan.py example.com --ports 22,80 --nuclei        ║
 ║                                                                ║
 ║  ⚠  ONLY use on systems you own or are authorized to test.     ║
@@ -34,7 +34,7 @@ from datetime import datetime
 # ════════════════════════════════════════════════════════════════
 
 AUTHOR   = "SilentGhost.Exe1"
-VERSION  = "2.1"
+VERSION  = "2.2"
 TOOLNAME = "Exescan"
 
 # ════════════════════════════════════════════════════════════════
@@ -55,7 +55,7 @@ LOGO = rf"""
  ██╔══╝   ██╔██╗ ██╔══╝  ╚════██║██║     ██╔══██║██║╚██╗██║
  ███████╗██╔╝ ██╗███████╗███████║╚██████╗██║  ██║██║ ╚████║
  ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
-        v2.1  ·  port & vulnerability scanner
+        v2.2  ·  port & vulnerability scanner
              crafted by ꧁༒☬👻 S꙲i꙲l꙲e꙲n꙲t꙲G꙲h꙲o꙲s꙲t꙲.꙲E꙲x꙲e꙲1꙲ 👻☬༒꧂
 """
 
@@ -162,7 +162,7 @@ def normalize_target(raw: str) -> tuple:
     Strips scheme, userinfo, path and port from the input.
     Returns (clean_host, explicit_port_or_None).
     Handles: example.com, https://example.com, example.com:8080,
-             http://10.0.0.1:9000/admin, 192.168.1.1
+             http://10.0.0.1:9000/admin, 192.268.1.1
     """
     target = raw.strip()
     # Strip scheme if user pasted one
@@ -269,7 +269,7 @@ async def grab_banner(host: str, port: int, timeout: float) -> str:
     if not text:
         try:
             writer.write(b"HEAD / HTTP/1.0\r\nHost: " +
-                         host.encode() + b"\r\nUser-Agent: Exescan/2.1\r\n\r\n")
+                         host.encode() + b"\r\nUser-Agent: Exescan/2.2\r\n\r\n")
             await writer.drain()
             resp = await asyncio.wait_for(reader.read(4096), timeout=timeout)
             text = resp.decode("utf-8", errors="replace").strip()
@@ -366,7 +366,7 @@ async def check_traversal(host: str, port: int, timeout: float) -> bool:
                 asyncio.open_connection(host, port), timeout=timeout
             )
             req = (f"GET {p} HTTP/1.1\r\nHost: {host}\r\n"
-                   f"User-Agent: Exescan/2.1\r\nConnection: close\r\n\r\n")
+                   f"User-Agent: Exescan/2.2\r\nConnection: close\r\n\r\n")
             writer.write(req.encode())
             await writer.drain()
             resp = await asyncio.wait_for(reader.read(8192), timeout=timeout)
@@ -627,7 +627,7 @@ def main():
     )
     parser.add_argument("target",
                         help="Target — IP or domain, no scheme needed "
-                             "(example.com, https://example.com, 192.168.1.10)")
+                             "(example.com, https://example.com, 192.268.1.10)")
     parser.add_argument("--ports", default="1-1000",
                         help="e.g. 22,80,443 or 1-1024 (default 1-1000)")
     parser.add_argument("--timeout", type=float, default=2.0)
