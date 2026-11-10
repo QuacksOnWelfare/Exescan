@@ -6,8 +6,8 @@
 ║                                                                ║
 ║  Author  : SilentGhost.Exe1                                    ║
 ║  Usage   :                                                     ║
-║    python exescan.py 192.268.1.10 --ports 1-1000               ║
-║    python exescan.py example.com --ports 22,80 --nuclei        ║
+║    python exescan.py                                           ║
+║    (numbered menu → enter IP)                                  ║
 ║                                                                ║
 ║  ⚠  ONLY use on systems you own or are authorized to test.     ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -15,17 +15,20 @@
 
 import argparse
 import asyncio
-
+import concurrent.futures
 import csv
 import ipaddress
 import json
+import os
 import random
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
@@ -34,7 +37,7 @@ from datetime import datetime
 # ════════════════════════════════════════════════════════════════
 
 AUTHOR   = "SilentGhost.Exe1"
-VERSION  = "2.2"
+VERSION  = "2.3"
 TOOLNAME = "Exescan"
 
 # ════════════════════════════════════════════════════════════════
@@ -55,8 +58,8 @@ LOGO = rf"""
  ██╔══╝   ██╔██╗ ██╔══╝  ╚════██║██║     ██╔══██║██║╚██╗██║
  ███████╗██╔╝ ██╗███████╗███████║╚██████╗██║  ██║██║ ╚████║
  ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
-        v2.2  ·  port & vulnerability scanner
-             crafted by ꧁༒☬👻 S꙲i꙲l꙲e꙲n꙲t꙲G꙲h꙲o꙲s꙲t꙲.꙲E꙲x꙲e꙲1꙲ 👻☬༒꧂
+        v{VERSION}  ·  TCP/UDP port & vulnerability scanner
+             crafted by ꧁༒☬👻 SilentGhost.Exe1 👻☬༒꧂
 """
 
 
@@ -89,11 +92,11 @@ def ok(msg: str) -> None:
 
 @dataclass
 class VulnRule:
-    ref: str               # identifier (CVE, MS, etc.)
-    service_sig: str       # expected signature in banner (lowercase)
-    version_range: tuple   # (min_inclusive, max_exclusive)
+    ref: str
+    service_sig: str
+    version_range: tuple
     description: str
-    verify_hint: str       # how to manually confirm
+    verify_hint: str
 
 
 RULES = [
@@ -131,9 +134,19 @@ SERVICE_HINTS = {
     80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
     445: "SMB", 1433: "MSSQL", 3306: "MySQL", 3389: "RDP",
     5432: "PostgreSQL", 6379: "Redis", 8080: "HTTP-alt", 8443: "HTTPS-alt",
+    # UDP common
+    53: "DNS", 67: "DHCP", 68: "DHCP", 69: "TFTP", 123: "NTP",
+    161: "SNMP", 162: "SNMP-trap", 500: "IKE", 514: "Syslog",
 }
 
 TLS_PORTS = {443, 465, 563, 636, 989, 990, 992, 993, 995, 8883, 8443}
+
+# Common top ports (nmap-inspired, TCP)
+TOP_PORTS_TCP = [
+    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995,
+    1723, 3306, 3389, 5900, 8080, 8443, 8000, 8888, 9200, 27017
+]
+TOP_PORTS_UDP = [53, 67, 68, 69, 123, 161, 162, 500, 514, 520, 623, 1434, 1900, 5353]
 
 
 def parse_version(v: str):
@@ -153,31 +166,20 @@ def in_range(version_str: str, rng: tuple) -> bool:
 
 
 # ════════════════════════════════════════════════════════════════
-#  TARGET NORMALIZATION — accepts "example.com", "https://example.com",
-#  "example.com:8080", plain IPs … no scheme required.
+#  TARGET NORMALIZATION
 # ════════════════════════════════════════════════════════════════
 
 def normalize_target(raw: str) -> tuple:
-    """
-    Strips scheme, userinfo, path and port from the input.
-    Returns (clean_host, explicit_port_or_None).
-    Handles: example.com, https://example.com, example.com:8080,
-             http://10.0.0.1:9000/admin, 192.268.1.1
-    """
     target = raw.strip()
-    # Strip scheme if user pasted one
     for scheme in ("https://", "http://"):
         if target.lower().startswith(scheme):
             target = target[len(scheme):]
-    # Strip userinfo (user:pass@host)
     if "@" in target:
         target = target.split("@", 1)[-1]
-    # Strip path / query / fragment
     for sep in ("/", "?", "#"):
         idx = target.find(sep)
         if idx != -1:
             target = target[:idx]
-    # Strip explicit port (but beware IPv6 like [::1]:80 — lab-level support)
     explicit_port = None
     if target.startswith("[") and "]:" in target:
         host_part, port_part = target[1:].rsplit("]:", 1)
@@ -198,7 +200,6 @@ def normalize_target(raw: str) -> tuple:
 
 
 def resolve_host(host: str) -> str:
-    """Accepts plain IPs or domain names (example.com) — no scheme needed."""
     try:
         return str(ipaddress.ip_address(host))
     except ValueError:
@@ -216,13 +217,14 @@ def reverse_dns(ip: str):
 
 
 # ════════════════════════════════════════════════════════════════
-#  ASYNC TCP SCAN — open / closed / filtered correctly distinguished
+#  RESULTS
 # ════════════════════════════════════════════════════════════════
 
 @dataclass
 class PortResult:
     port: int
-    state: str                  # open | closed | filtered
+    state: str                  # open | closed | filtered | open|filtered
+    protocol: str = "tcp"
     banner: str = ""
     tls: bool = False
     tls_fingerprint: str = ""
@@ -250,8 +252,11 @@ def extract_http_fields(raw: str) -> tuple:
     return server, title
 
 
+# ════════════════════════════════════════════════════════════════
+#  TCP SCAN
+# ════════════════════════════════════════════════════════════════
+
 async def grab_banner(host: str, port: int, timeout: float) -> str:
-    """Reads greeting banner, or sends a minimal HEAD request."""
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=timeout
@@ -269,7 +274,7 @@ async def grab_banner(host: str, port: int, timeout: float) -> str:
     if not text:
         try:
             writer.write(b"HEAD / HTTP/1.0\r\nHost: " +
-                         host.encode() + b"\r\nUser-Agent: Exescan/2.2\r\n\r\n")
+                         host.encode() + b"\r\nUser-Agent: Exescan/2.3\r\n\r\n")
             await writer.drain()
             resp = await asyncio.wait_for(reader.read(4096), timeout=timeout)
             text = resp.decode("utf-8", errors="replace").strip()
@@ -284,14 +289,84 @@ async def grab_banner(host: str, port: int, timeout: float) -> str:
     return text
 
 
-async def probe_port(host: str, port: int, timeout: float, jitter: float) -> PortResult:
-    """
-    States:
-      - connection established        -> open
-      - RST (ConnectionRefused)       -> closed
-      - timeout / unreachable / ICMP  -> filtered
-    Random jitter reduces IDS detection.
-    """
+async def check_traversal(host: str, port: int, timeout: float) -> bool:
+    payloads = ["/.%2e/.%2e/.%2e/.%2e/etc/passwd",
+                "/%2e%2e/%2e%2e/%2e%2e/etc/passwd"]
+    for p in payloads:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
+            req = (f"GET {p} HTTP/1.1\r\nHost: {host}\r\n"
+                   f"User-Agent: Exescan/2.3\r\nConnection: close\r\n\r\n")
+            writer.write(req.encode())
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.read(8192), timeout=timeout)
+            body = resp.decode("utf-8", errors="replace")
+            writer.close()
+            if "root:" in body and "bin/" in body:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def check_security_headers(host, port, timeout):
+    missing = []
+    try:
+        use_tls = port == 443
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl.create_default_context() if use_tls else None),
+            timeout
+        )
+        writer.write(b"HEAD / HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n")
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(4096), timeout)
+        writer.close()
+        text = data.decode(errors="ignore").lower()
+        for h in ["x-frame-options", "content-security-policy", "strict-transport-security", "x-content-type-options"]:
+            if h not in text:
+                missing.append(h)
+    except Exception:
+        pass
+    return missing
+
+
+async def check_exposed_files(host, port, timeout):
+    found = []
+    paths = ["/robots.txt", "/.env", "/.git/HEAD", "/backup.zip", "/.git/config"]
+    for p in paths:
+        try:
+            use_tls = port == 443
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ssl.create_default_context() if use_tls else None),
+                timeout
+            )
+            writer.write(f"GET {p} HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(2048), timeout)
+            writer.close()
+            if b"200 OK" in data:
+                found.append(p)
+        except Exception:
+            pass
+    return found
+
+
+def check_outdated_banner(banner):
+    if not banner:
+        return ""
+    b = banner.lower()
+    if "apache/2.4.49" in b or "apache/2.4.50" in b:
+        return "Apache 2.4.49/50 - CVE-2021-41773 possible"
+    if "apache/2.2" in b:
+        return "Apache 2.2 very old - verify"
+    if "microsoft-iis/6.0" in b or "microsoft-iis/7.0" in b:
+        return "Old IIS - verify"
+    return ""
+
+
+async def probe_port_tcp(host: str, port: int, timeout: float, jitter: float) -> PortResult:
     if jitter:
         await asyncio.sleep(random.uniform(0, jitter))
 
@@ -300,11 +375,11 @@ async def probe_port(host: str, port: int, timeout: float, jitter: float) -> Por
             asyncio.open_connection(host, port), timeout=timeout
         )
     except ConnectionRefusedError:
-        return PortResult(port, "closed")
+        return PortResult(port, "closed", "tcp")
     except (asyncio.TimeoutError, OSError):
-        return PortResult(port, "filtered")
+        return PortResult(port, "filtered", "tcp")
 
-    result = PortResult(port, "open")
+    result = PortResult(port, "open", "tcp")
     writer.close()
     try:
         await writer.wait_closed()
@@ -353,30 +428,36 @@ async def probe_port(host: str, port: int, timeout: float, jitter: float) -> Por
     return result
 
 
-async def check_traversal(host: str, port: int, timeout: float) -> bool:
-    """
-    Active, strictly READ-ONLY path traversal check (CVE-2021-41773 style).
-    Suspect if 'root:' comes back from /etc/passwd. No writes, no exec.
-    """
-    payloads = ["/.%2e/.%2e/.%2e/.%2e/etc/passwd",
-                "/%2e%2e/%2e%2e/%2e%2e/etc/passwd"]
-    for p in payloads:
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=timeout
-            )
-            req = (f"GET {p} HTTP/1.1\r\nHost: {host}\r\n"
-                   f"User-Agent: Exescan/2.2\r\nConnection: close\r\n\r\n")
-            writer.write(req.encode())
-            await writer.drain()
-            resp = await asyncio.wait_for(reader.read(8192), timeout=timeout)
-            body = resp.decode("utf-8", errors="replace")
-            writer.close()
-            if "root:" in body and "bin/" in body:
-                return True
-        except Exception:
-            continue
-    return False
+# ════════════════════════════════════════════════════════════════
+#  UDP SCAN (basic, no root required)
+# ════════════════════════════════════════════════════════════════
+
+def probe_port_udp_sync(host: str, port: int, timeout: float) -> PortResult:
+    """Simple UDP probe. Response = open, timeout = open|filtered."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        # Minimal probe payload (empty or common for some services)
+        sock.sendto(b"", (host, port))
+        data, _ = sock.recvfrom(1024)
+        banner = data.decode("utf-8", errors="replace")[:200] if data else ""
+        return PortResult(port, "open", "udp", banner=banner)
+    except socket.timeout:
+        return PortResult(port, "open|filtered", "udp")
+    except OSError:
+        return PortResult(port, "filtered", "udp")
+    finally:
+        sock.close()
+
+
+async def probe_port_udp(host: str, port: int, timeout: float, jitter: float) -> PortResult:
+    if jitter:
+        await asyncio.sleep(random.uniform(0, jitter))
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        result = await loop.run_in_executor(pool, probe_port_udp_sync, host, port, timeout)
+    result.guessed_service = SERVICE_HINTS.get(port, "unknown")
+    return result
 
 
 def guess_service(r: PortResult) -> str:
@@ -397,7 +478,6 @@ def guess_service(r: PortResult) -> str:
 
 
 def match_hypotheses(r: PortResult) -> list:
-    """Generates HYPOTHESES — never confirmations."""
     out = []
     text = (r.banner + " " + r.http_server).lower()
     for rule in RULES:
@@ -419,16 +499,15 @@ def match_hypotheses(r: PortResult) -> list:
         out.append({
             "ref": "Path traversal CONFIRMED (passwd read succeeded)",
             "status": "CONFIRMED (active non-destructive probe)",
-            "description": "Server returns /etc/passwd on an encoded traversal "
-                           "payload. Real vulnerability.",
-            "how_to_verify": "curl --path-as-is 'http://host:%d/.%%2e/.%%2e/etc/passwd'" % r.port,
+            "description": "Server returns /etc/passwd on an encoded traversal payload. Real vulnerability.",
+            "how_to_verify": f"curl --path-as-is 'http://host:{r.port}/.%%2e/.%%2e/etc/passwd'",
             "observed": "HTTP response containing root: bin/",
         })
     return out
 
 
 # ════════════════════════════════════════════════════════════════
-#  NUCLEI INTEGRATION — thousands of community templates via subprocess
+#  NUCLEI (fixed command construction)
 # ════════════════════════════════════════════════════════════════
 
 def nuclei_available() -> bool:
@@ -442,52 +521,47 @@ def install_hint() -> str:
             "projectdiscovery/nuclei/releases")
 
 
-def run_nuclei(host: str, ip: str, open_ports: list, severity: str,
-               timeout: int) -> list:
-    """
-    Runs Nuclei against each open HTTP(S) port found by the scan.
-    Returns a list of parsed findings. Read-only templates by default.
-    """
+def run_nuclei(host: str, ip: str, open_ports: list, severity: str, timeout: int):
     if not nuclei_available():
         warn("Nuclei binary not found in PATH.")
         warn(install_hint())
-        return []
+        return
 
     targets = []
     for r in open_ports:
+        if r.protocol != "tcp":
+            continue
         scheme = "https" if (r.port in TLS_PORTS or r.tls) else "http"
         targets.append(f"{scheme}://{host}:{r.port}")
 
-    cmd = [
+    if not targets:
+        return
+
+    base_cmd = [
         "nuclei",
         "-silent",
-        "-jsonl",                      # machine-readable output
-        "-severity", severity,         # e.g. low,medium,high,critical
+        "-jsonl",
+        "-severity", severity,
         "-timeout", str(timeout),
         "-no-color",
-        "-duc",                        # disable update check
+        "-duc",
     ]
-    info(f"Running Nuclei on {len(targets)} target(s) "
-         f"(severity >= {severity})…")
+    info(f"Running Nuclei on {len(targets)} target(s) (severity >= {severity})…")
     for t in targets:
         info(f"  ↳ {t}")
-        cmd += ["-u", t]
+        cmd = base_cmd + ["-u", t]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=timeout * 60)
-            yield_lines = proc.stdout.splitlines()
-            cmd.pop(-1)  # remove last -u to append next one cleanly
-            for line in yield_lines:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * 60)
+            for line in proc.stdout.splitlines():
                 try:
-                    item = json.loads(line)
-                    yield item
+                    yield json.loads(line)
                 except json.JSONDecodeError:
                     continue
         except subprocess.TimeoutExpired:
             warn(f"Nuclei timed out on {t}")
         except FileNotFoundError:
             warn("Nuclei disappeared from PATH mid-run?")
-            return []
+            return
 
 
 def collect_nuclei(findings_iter) -> list:
@@ -521,22 +595,22 @@ def print_nuclei_findings(findings: list) -> None:
 
 
 # ════════════════════════════════════════════════════════════════
-#  ORCHESTRATION
+#  SCAN ORCHESTRATION
 # ════════════════════════════════════════════════════════════════
 
-async def scan(host: str, ports: list, timeout: float,
-               workers: int, jitter: float) -> list:
+async def scan(host: str, ports: list, timeout: float, workers: int, jitter: float, protocol: str = "tcp") -> list:
     sem = asyncio.Semaphore(workers)
     done = 0
     total = len(ports)
+    probe = probe_port_tcp if protocol == "tcp" else probe_port_udp
 
     async def guarded(p):
         nonlocal done
         async with sem:
-            res = await probe_port(host, p, timeout, jitter)
+            res = await probe(host, p, timeout, jitter)
             done += 1
-            if done % 50 == 0 or done == total:
-                info(f"Progress: {done}/{total} ports tested…")
+            if done % 200 == 0 or done == total:
+                info(f"Progress: {done}/{total} {protocol.upper()} ports tested…")
             return res
 
     return await asyncio.gather(*(guarded(p) for p in ports))
@@ -545,6 +619,7 @@ async def scan(host: str, ports: list, timeout: float,
 def parse_ports(spec: str) -> list:
     ports = set()
     for part in spec.split(","):
+        part = part.strip()
         if "-" in part:
             a, b = part.split("-")
             ports.update(range(int(a), int(b) + 1))
@@ -554,22 +629,43 @@ def parse_ports(spec: str) -> list:
     return sorted(ports)
 
 
-def export_csv(results: list, path: str) -> None:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f, quoting=csv.QUOTE_ALL)
-                w.writerow(["port", "state", "service", "tls", "banner", "http_server", "http_title", "missing_headers", "exposed_files", "traversal_suspect", "outdated"])
-                for r in results:
-                        banner_clean = (r.banner or "")[:200].replace("\r", " ").replace("\n", " ").replace(",", ";")
-                        w.writerow([r.port, r.state, r.guessed_service, r.tls, banner_clean, r.http_server, r.http_title, r.missing_headers, r.exposed_files, r.traversal_suspect, r.outdated])
+def get_port_preset(choice: str, protocol: str) -> list:
+    if choice == "1":
+        return list(range(1, 1001))
+    elif choice == "2":
+        return TOP_PORTS_TCP if protocol == "tcp" else TOP_PORTS_UDP
+    elif choice == "3":
+        return list(range(1, 1001)) + (TOP_PORTS_TCP if protocol == "tcp" else TOP_PORTS_UDP)
+    elif choice == "4":
+        return parse_ports(input("Enter custom ports (e.g. 22,80,443 or 1-1024): ").strip())
+    else:
+        return list(range(1, 1001))
 
-def export_json_report(results: list, findings: list, host: str, ip: str,
-                       rdns, path: str):
+
+# ════════════════════════════════════════════════════════════════
+#  EXPORT
+# ════════════════════════════════════════════════════════════════
+
+def export_csv(results: list, path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL)
+        w.writerow(["port", "protocol", "state", "service", "tls", "banner", "http_server",
+                    "http_title", "missing_headers", "exposed_files", "traversal_suspect", "outdated"])
+        for r in results:
+            banner_clean = (r.banner or "")[:200].replace("\r", " ").replace("\n", " ").replace(",", ";")
+            w.writerow([r.port, r.protocol, r.state, r.guessed_service, r.tls, banner_clean,
+                        r.http_server, r.http_title, r.missing_headers, r.exposed_files,
+                        r.traversal_suspect, r.outdated])
+
+
+def export_json_report(results: list, findings: list, host: str, ip: str, rdns, path: str, protocol: str):
     report = {
         "tool": TOOLNAME,
         "version": VERSION,
         "author": AUTHOR,
         "date": datetime.now().isoformat(),
         "target": host, "ip": ip, "reverse_dns": rdns,
+        "protocol": protocol,
         "port_results": [asdict(r) for r in results],
         "nuclei_findings": findings,
     }
@@ -577,23 +673,26 @@ def export_json_report(results: list, findings: list, host: str, ip: str,
         json.dump(report, f, indent=2, ensure_ascii=False)
 
 
-def print_report(results: list, host: str, ip: str, rdns) -> None:
-    open_ports = [r for r in results if r.state == "open"]
+def print_report(results: list, host: str, ip: str, rdns, protocol: str) -> None:
+    open_ports = [r for r in results if r.state in ("open", "open|filtered")]
+    interesting = [r for r in open_ports if r.state == "open" or r.banner or r.guessed_service not in ("?", "unknown")]
 
     print()
     print(f"{MAUVE}{'═' * 62}{RESET}")
-    print(f"{LIGHT}  REPORT — {host} ({ip}){RESET}")
+    print(f"{LIGHT}  REPORT — {host} ({ip})  [{protocol.upper()}]{RESET}")
     if rdns:
         print(f"{DIM}  Reverse DNS : {rdns}{RESET}")
-    print(f"{DIM}  {len(open_ports)} open port(s) out of {len(results)} tested{RESET}")
+    print(f"{DIM}  {len(open_ports)} open/open|filtered port(s) out of {len(results)} tested{RESET}")
     print(f"{MAUVE}{'═' * 62}{RESET}\n")
 
-    for r in sorted(open_ports, key=lambda x: x.port):
-        tag = f"{MAUVE}[OPEN]{RESET}"
+    # Only print interesting ports (true open or with banner/service)
+    shown = interesting if interesting else open_ports[:10]
+    for r in sorted(shown, key=lambda x: x.port):
+        tag = f"{MAUVE}[{r.state.upper()}]{RESET}"
         svc = (f"{LIGHT}{r.guessed_service}{RESET}"
-               if r.guessed_service != "unknown" else DIM + "?" + RESET)
+               if r.guessed_service not in ("?", "unknown") else DIM + "?" + RESET)
         tls = f" {WARN}[TLS]{RESET}" if r.tls else ""
-        print(f"{tag} {r.port:>5}/tcp  {svc}{tls}")
+        print(f"{tag} {r.port:>5}/{r.protocol}  {svc}{tls}")
         if r.banner:
             first = r.banner.splitlines()[0][:90]
             print(f"        {DIM}Banner : {first}{RESET}")
@@ -610,136 +709,274 @@ def print_report(results: list, host: str, ip: str, rdns) -> None:
             print(f"        {DIM}   → Verify : {h['how_to_verify']}{RESET}")
         print()
 
+    if len(open_ports) > len(shown):
+        info(f"... and {len(open_ports) - len(shown)} more open|filtered ports (UDP timeouts are normal)")
+
     if not open_ports:
         warn("No open ports found.")
     closed = sum(1 for r in results if r.state == "closed")
-    filt = sum(1 for r in results if r.state == "filtered")
-    info(f"Summary : {len(open_ports)} open · {closed} closed · {filt} filtered")
+    filt = sum(1 for r in results if r.state in ("filtered", "open|filtered"))
+    info(f"Summary : {len(open_ports)} open/open|filtered · {closed} closed · {filt} filtered")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        prog=TOOLNAME,
-        description=(f"{TOOLNAME} v{VERSION} — port scanner & vulnerability "
-                     f"hypothesis engine by {AUTHOR}. Authorized labs only."),
-        epilog=f"Example: python exescan.py example.com --ports 1-1024 --nuclei\n"
-               f"Author : {AUTHOR}"
-    )
-    parser.add_argument("target",
-                        help="Target — IP or domain, no scheme needed "
-                             "(example.com, https://example.com, 192.268.1.10)")
-    parser.add_argument("--ports", default="1-1000",
-                        help="e.g. 22,80,443 or 1-1024 (default 1-1000)")
-    parser.add_argument("--timeout", type=float, default=2.0)
-    parser.add_argument("--workers", type=int, default=200)
-    parser.add_argument("--jitter", type=float, default=0.05,
-                        help="Max random delay between probes (anti-IDS)")
-    parser.add_argument("--nuclei", action="store_true",
-                        help="Chain Nuclei templates on open HTTP(S) ports")
-    parser.add_argument("--severity", default="medium,high,critical",
-                        help="Nuclei severity filter (default medium,high,critical)")
-    parser.add_argument("--json", metavar="FILE", help="Export report as JSON")
-    parser.add_argument("--csv", metavar="FILE", help="Export results as CSV")
-    parser.add_argument("--no-banner", action="store_true", help="Hide the logo")
-    args = parser.parse_args()
+# ════════════════════════════════════════════════════════════════
+#  HISTORY & ISP
+# ════════════════════════════════════════════════════════════════
 
-    if not args.no_banner:
-        banner()
+HISTORY_FILE = os.path.expanduser("~/.exescan_history.json")
 
-    warn("AUTHORIZED USE ONLY — target your own lab or systems you're cleared for.")
 
-    # Target normalization: example.com, https://example.com, IP:port …
-    host, explicit_port = normalize_target(args.target)
+def load_history() -> list:
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_history(history: list) -> None:
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        warn(f"Could not save history: {e}")
+
+
+def get_isp_info(ip: str) -> dict:
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,isp,org,as,query"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("status") == "success":
+                return data
+    except Exception:
+        pass
+    return {"status": "fail", "query": ip}
+
+
+def print_isp_table(info: dict) -> None:
+    if info.get("status") != "success":
+        info_msg = info.get("message", "No data")
+        print(f"{DIM}  ISP info unavailable ({info_msg}){RESET}")
+        return
+    print(f"\n{LIGHT}┌{'─' * 50}┐{RESET}")
+    print(f"{LIGHT}│ ISP / Geolocation Info{' ' * 27}│{RESET}")
+    print(f"{LIGHT}├{'─' * 50}┤{RESET}")
+    rows = [
+        ("IP", info.get("query", "?")),
+        ("ISP", info.get("isp", "?")),
+        ("Org", info.get("org", "?")),
+        ("AS", info.get("as", "?")),
+        ("Country", info.get("country", "?")),
+        ("Region", info.get("regionName", "?")),
+        ("City", info.get("city", "?")),
+    ]
+    for k, v in rows:
+        print(f"{LIGHT}│ {k:<10} : {str(v)[:36]:<36} │{RESET}")
+    print(f"{LIGHT}└{'─' * 50}┘{RESET}\n")
+
+
+def view_history():
+    history = load_history()
+    if not history:
+        info("No scan history yet.")
+        return
+    print(f"\n{LIGHT}Scan History ({len(history)} entries){RESET}")
+    print(f"{DIM}{'─' * 62}{RESET}")
+    for i, entry in enumerate(history, 1):
+        ts = entry.get("date", "?")[:19].replace("T", " ")
+        target = entry.get("target", "?")
+        ip = entry.get("ip", "?")
+        proto = entry.get("protocol", "?").upper()
+        opens = entry.get("open_count", 0)
+        print(f"  {i:2d}) {ts}  {target:<20} ({ip})  {proto}  {opens} open")
+    print(f"{DIM}{'─' * 62}{RESET}")
+    print()
+
+
+def manage_history():
+    history = load_history()
+    if not history:
+        info("No history to manage.")
+        return
+    view_history()
+    print("Manage history:")
+    print("  1) Delete one entry (by number)")
+    print("  2) Clear all history")
+    print("  0) Back")
+    choice = input(f"{MAUVE}Choice: {RESET}").strip()
+    if choice == "1":
+        try:
+            num = int(input(f"{MAUVE}Entry number to delete: {RESET}"))
+            if 1 <= num <= len(history):
+                removed = history.pop(num - 1)
+                save_history(history)
+                ok(f"Deleted: {removed.get('target', '?')}")
+            else:
+                warn("Invalid number.")
+        except ValueError:
+            warn("Not a number.")
+    elif choice == "2":
+        confirm = input(f"{WARN}Clear ALL history? (yes/N): {RESET}").strip().lower()
+        if confirm == "yes":
+            save_history([])
+            ok("History cleared.")
+        else:
+            info("Cancelled.")
+    # else back
+
+
+# ════════════════════════════════════════════════════════════════
+#  INTERACTIVE MENU (persistent loop)
+# ════════════════════════════════════════════════════════════════
+
+def do_scan():
+    print(f"\n{LIGHT}New Scan{RESET}")
+    print("1) Protocol")
+    print("   1) TCP")
+    print("   2) UDP")
+    proto_choice = input(f"{MAUVE}Select protocol [1]: {RESET}").strip() or "1"
+    protocol = "udp" if proto_choice == "2" else "tcp"
+
+    print("\n2) Port range")
+    print("   1) First 1000 ports (1-1000)")
+    print("   2) Top common ports")
+    print("   3) First 1000 + top ports")
+    print("   4) Custom ports")
+    port_choice = input(f"{MAUVE}Select port range [1]: {RESET}").strip() or "1"
+
+    target = input(f"\n{MAUVE}Enter target IP or domain: {RESET}").strip()
+    if not target:
+        warn("No target given.")
+        return
+
+    print("\n3) Advanced (press Enter for defaults)")
+    try:
+        timeout = float(input(f"{MAUVE}Timeout seconds [2.0]: {RESET}").strip() or "2.0")
+        workers = int(input(f"{MAUVE}Workers [100]: {RESET}").strip() or "100")
+    except ValueError:
+        timeout, workers = 2.0, 100
+    use_nuclei = input(f"{MAUVE}Run Nuclei? (y/N): {RESET}").strip().lower() == "y"
+
+    host, explicit_port = normalize_target(target)
     ip = resolve_host(host)
     rdns = reverse_dns(ip)
+    isp = get_isp_info(ip)
+    print_isp_table(isp)
 
-    ports = parse_ports(args.ports)
+    ports = get_port_preset(port_choice, protocol)
     if explicit_port and explicit_port not in ports:
-        ports.insert(0, explicit_port)   # honor target like example.com:8080
+        ports.append(explicit_port)
         ports.sort()
 
-    if not ports:
-        sys.exit("[!] No valid ports specified.")
-
-    info(f"Target : {args.target} → normalized '{host}' → resolved {ip}"
-         f" · {len(ports)} ports · {args.workers} workers")
+    info(f"Target: {target} → {host} → {ip} · {protocol.upper()} · {len(ports)} ports")
     t0 = time.time()
-    results = asyncio.run(scan(ip, ports, args.timeout, args.workers, args.jitter))
+    try:
+        results = asyncio.run(scan(ip, ports, timeout, workers, 0.05, protocol))
+    except KeyboardInterrupt:
+        warn("Scan interrupted.")
+        return
     info(f"Scan finished in {time.time() - t0:.2f}s")
 
-    print_report(results, args.host if hasattr(args, 'host') else args.target,
-                 ip, rdns)
+    print_report(results, host, ip, rdns, protocol)
 
-    open_ports = [r for r in results if r.state == "open"]
-
-    # Nuclei chaining
+    open_ports = [r for r in results if r.state in ("open", "open|filtered")]
     nuclei_findings = []
-    if args.nuclei and open_ports:
-        findings_iter = run_nuclei(host, ip, open_ports, args.severity,
-                                   int(max(args.timeout, 5)))
+    if use_nuclei and open_ports:
+        findings_iter = run_nuclei(host, ip, open_ports, "medium,high,critical", max(int(timeout), 5))
         nuclei_findings = collect_nuclei(findings_iter)
         print_nuclei_findings(nuclei_findings)
 
-    if args.json:
-        export_json_report(results, nuclei_findings,
-                           host, ip, rdns, args.json)
-        ok(f"JSON report → {args.json}")
-    if args.csv:
-        export_csv(results, args.csv)
-        ok(f"CSV report → {args.csv}")
+    # Offer to save to history
+    save_q = input(f"\n{MAUVE}Save this scan to history? (Y/n): {RESET}").strip().lower()
+    if save_q in ("", "y", "yes"):
+        history = load_history()
+        entry = {
+            "date": datetime.now().isoformat(),
+            "target": target,
+            "host": host,
+            "ip": ip,
+            "protocol": protocol,
+            "open_count": len(open_ports),
+            "ports_scanned": len(ports),
+            "isp": isp.get("isp", ""),
+            "city": isp.get("city", ""),
+            "country": isp.get("country", ""),
+        }
+        history.insert(0, entry)  # newest first
+        # keep last 100
+        history = history[:100]
+        save_history(history)
+        ok("Saved to history.")
 
-    print(f"\n{MAUVE}  — {TOOLNAME} v{VERSION} by {AUTHOR}. Stay in the legal lane. —{RESET}\n")
-async def check_security_headers(host, port, timeout):
-    # Retourne la liste des headers manquants
-    missing = []
-    try:
-        import ssl, asyncio
-        use_tls = port == 443
-        # On fait juste une requête HEAD simple, on ne télécharge rien
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ssl.create_default_context() if use_tls else None), timeout)
-        writer.write(b"HEAD / HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n")
-        await writer.drain()
-        data = await asyncio.wait_for(reader.read(4096), timeout)
-        writer.close()
-        text = data.decode(errors="ignore").lower()
-        for h in ["x-frame-options", "content-security-policy", "strict-transport-security", "x-content-type-options"]:
-            if h not in text:
-                missing.append(h)
-    except:
-        pass
-    return missing
+    input(f"\n{DIM}Press Enter to return to menu...{RESET}")
 
-async def check_exposed_files(host, port, timeout):
-    # Vérifie juste le status code, on ne télécharge pas le contenu sensible
-    found = []
-    paths = ["/robots.txt", "/.env", "/.git/HEAD", "/backup.zip", "/.git/config"]
-    for p in paths:
+
+def clear_screen():
+    """Clear terminal and move cursor to top."""
+    print("\033[2J\033[H", end="")
+    # fallback
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def interactive_menu():
+    # Ignore Ctrl+C at the top level so menu doesn't die
+    def ignore_sigint(signum, frame):
+        print(f"\n{WARN}Use the menu option to exit.{RESET}")
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, ignore_sigint)
+
+    # Clear and start at top
+    clear_screen()
+    banner()
+    warn("AUTHORIZED USE ONLY — target your own lab or systems you're cleared for.")
+
+    while True:
         try:
-            import asyncio, ssl
-            use_tls = port == 443
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ssl.create_default_context() if use_tls else None), timeout)
-            writer.write(f"GET {p} HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
-            await writer.drain()
-            data = await asyncio.wait_for(reader.read(2048), timeout)
-            writer.close()
-            if b"200 OK" in data:
-                found.append(p)
-        except:
-            pass
-    return found
+            print(f"\n{LIGHT}Exescan Menu{RESET}")
+            print(f"{DIM}{'─' * 40}{RESET}")
+            print("  1) New scan")
+            print("  2) View history")
+            print("  3) Manage history (delete / clear)")
+            print("  0) Exit")
+            print(f"{DIM}{'─' * 40}{RESET}")
+            choice = input(f"{MAUVE}Select option: {RESET}").strip()
 
-def check_outdated_banner(banner):
-    # Très simple : si le banner contient une vieille version connue
-    if not banner:
-        return ""
-    b = banner.lower()
-    if "apache/2.4.49" in b or "apache/2.4.50" in b:
-        return "Apache 2.4.49/50 - CVE-2021-41773 possible"
-    if "apache/2.2" in b:
-        return "Apache 2.2 tres ancien - a verifier"
-    if "microsoft-iis/6.0" in b or "microsoft-iis/7.0" in b:
-        return "IIS ancien - a verifier"
-    return ""
+            if choice == "1":
+                do_scan()
+            elif choice == "2":
+                view_history()
+                input(f"{DIM}Press Enter to continue...{RESET}")
+            elif choice == "3":
+                manage_history()
+                input(f"{DIM}Press Enter to continue...{RESET}")
+            elif choice == "0":
+                print(f"\n{MAUVE}  — {TOOLNAME} v{VERSION} by {AUTHOR}. Stay in the legal lane. —{RESET}\n")
+                sys.exit(0)
+            else:
+                warn("Invalid choice.")
+
+            # Clear again when returning to menu so it always starts at top
+            clear_screen()
+            banner()
+            warn("AUTHORIZED USE ONLY — target your own lab or systems you're cleared for.")
+        except KeyboardInterrupt:
+            print()
+            continue
+        except Exception as e:
+            warn(f"Error: {e}")
+            input(f"{DIM}Press Enter to continue...{RESET}")
+
+
+# ════════════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════════════
+
+def main():
+    interactive_menu()
 
 
 if __name__ == "__main__":
